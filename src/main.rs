@@ -78,6 +78,25 @@ enum GreetdResult {
     Error(String),
 }
 
+fn start_session(
+    stream: &mut UnixStream,
+    session_cmd: &[String],
+) -> GreetdResult {
+    let req = Request::StartSession {
+        cmd: session_cmd.to_vec(),
+        env: Vec::new(),
+    };
+    if let Err(e) = req.write_to(stream) {
+        return GreetdResult::Error(format!("write start: {e}"));
+    }
+    match Response::read_from(stream) {
+        Ok(Response::Success) => GreetdResult::Success,
+        Ok(Response::Error { description, .. }) => GreetdResult::Error(description),
+        Ok(_) => GreetdResult::Error("unexpected response after start".into()),
+        Err(e) => GreetdResult::Error(format!("read start: {e}")),
+    }
+}
+
 /// Run the full greetd login flow on a single connection.
 fn greetd_login(username: &str, password: &str, session_cmd: &[String]) -> GreetdResult {
     let sock_path = match env::var("GREETD_SOCK") {
@@ -108,43 +127,13 @@ fn greetd_login(username: &str, password: &str, session_cmd: &[String]) -> Greet
             }
 
             match Response::read_from(&mut stream) {
-                Ok(Response::Success) => {
-                    // Step 3: Start session
-                    let req = Request::StartSession {
-                        cmd: session_cmd.to_vec(),
-                        env: Vec::new(),
-                    };
-                    if let Err(e) = req.write_to(&mut stream) {
-                        return GreetdResult::Error(format!("write start: {e}"));
-                    }
-                    match Response::read_from(&mut stream) {
-                        Ok(Response::Success) => GreetdResult::Success,
-                        Ok(Response::Error { description, .. }) => GreetdResult::Error(description),
-                        Ok(_) => GreetdResult::Error("unexpected response after start".into()),
-                        Err(e) => GreetdResult::Error(format!("read start: {e}")),
-                    }
-                }
+                Ok(Response::Success) => start_session(&mut stream, session_cmd),
                 Ok(Response::Error { description, .. }) => GreetdResult::Error(description),
                 Ok(resp) => GreetdResult::Error(format!("unexpected after auth: {resp:?}")),
                 Err(e) => GreetdResult::Error(format!("read auth: {e}")),
             }
         }
-        Ok(Response::Success) => {
-            // No auth needed, start session directly
-            let req = Request::StartSession {
-                cmd: session_cmd.to_vec(),
-                env: Vec::new(),
-            };
-            if let Err(e) = req.write_to(&mut stream) {
-                return GreetdResult::Error(format!("write start: {e}"));
-            }
-            match Response::read_from(&mut stream) {
-                Ok(Response::Success) => GreetdResult::Success,
-                Ok(Response::Error { description, .. }) => GreetdResult::Error(description),
-                Ok(_) => GreetdResult::Error("unexpected response after start".into()),
-                Err(e) => GreetdResult::Error(format!("read start: {e}")),
-            }
-        }
+        Ok(Response::Success) => start_session(&mut stream, session_cmd),
         Ok(Response::Error { description, .. }) => GreetdResult::Error(description),
         Err(e) => GreetdResult::Error(format!("read create: {e}")),
     }
@@ -352,8 +341,7 @@ fn view(state: &Greeter) -> Element<'_, Message> {
             width: 1.0,
             color: color!(0x8C, 0xAA, 0xFF, 0.4),
         },
-        shadow: Shadow::default(),
-        snap: false,
+        ..Default::default()
     })
     .on_press_maybe(if state.logging_in {
         None
@@ -366,7 +354,7 @@ fn view(state: &Greeter) -> Element<'_, Message> {
             .padding(8)
             .into()
     } else {
-        column![].into()
+        text("").into()
     };
 
     let destructive_style = |_theme: &Theme, _status| button::Style {
@@ -377,8 +365,7 @@ fn view(state: &Greeter) -> Element<'_, Message> {
             width: 1.0,
             color: color!(0xC8, 0x3C, 0x3C, 0.3),
         },
-        shadow: Shadow::default(),
-        snap: false,
+        ..Default::default()
     };
 
     let power_row = row![
@@ -433,10 +420,6 @@ fn view(state: &Greeter) -> Element<'_, Message> {
         .height(Length::Fill)
         .align_x(alignment::Horizontal::Center)
         .align_y(alignment::Vertical::Center)
-        .style(|_theme: &Theme| container::Style {
-            background: Some(Background::Color(Color::TRANSPARENT)),
-            ..Default::default()
-        })
         .into()
 }
 
