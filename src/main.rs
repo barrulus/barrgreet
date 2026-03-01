@@ -29,7 +29,12 @@ impl std::fmt::Display for Session {
 }
 
 fn detect_sessions() -> Vec<Session> {
-    let dirs = ["/usr/share/wayland-sessions", "/usr/share/xsessions"];
+    let dirs = [
+        "/usr/share/wayland-sessions",
+        "/usr/share/xsessions",
+        "/run/current-system/sw/share/wayland-sessions",
+        "/run/current-system/sw/share/xsessions",
+    ];
     let mut sessions = Vec::new();
 
     for dir in &dirs {
