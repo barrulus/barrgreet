@@ -1,0 +1,10 @@
+[package]
+name = "barrgreet"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+iced = "0.14"
+iced_layershell = "0.15"
+greetd_ipc = { version = "0.10", features = ["sync-codec"] }
+futures = "0.3"
