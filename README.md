@@ -158,6 +158,25 @@ Sessions are discovered from `.desktop` files in the directories listed in `gene
 - `/usr/local/share/wayland-sessions`
 - `/usr/local/share/xsessions`
 
+### NixOS session discovery
+
+On NixOS, you need to symlink session `.desktop` files into the system profile so barrgreet can find them. Add to your `configuration.nix`:
+
+```nix
+environment.pathsToLink = [
+  "/share/wayland-sessions"
+  "/share/xsessions"
+];
+```
+
+Some NixOS modules (e.g. `programs.steam.gamescopeSession`) register sessions via `services.displayManager.sessionPackages` rather than adding them to `environment.systemPackages`. Display managers like GDM/SDDM consume these automatically, but greetd does not. To make these sessions visible to barrgreet, add them to your system packages:
+
+```nix
+environment.systemPackages = config.services.displayManager.sessionPackages ++ [
+  # ... your other packages
+];
+```
+
 ## License
 
 [MIT](LICENSE)
