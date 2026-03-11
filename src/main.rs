@@ -32,8 +32,12 @@ fn detect_sessions() -> Vec<Session> {
     let dirs = [
         "/usr/share/wayland-sessions",
         "/usr/share/xsessions",
+        // NixOS system profile
         "/run/current-system/sw/share/wayland-sessions",
         "/run/current-system/sw/share/xsessions",
+        // Common additional locations
+        "/usr/local/share/wayland-sessions",
+        "/usr/local/share/xsessions",
     ];
     let mut sessions = Vec::new();
 
@@ -435,7 +439,38 @@ fn style(_state: &Greeter, _theme: &Theme) -> iced::theme::Style {
 }
 
 fn main() -> iced_layershell::Result {
-    iced_layershell::application(boot, namespace, update, view)
+    // Log startup diagnostics to stderr (visible via journalctl -u greetd)
+    eprintln!("[barrgreet] starting");
+
+    if let Ok(display) = env::var("WAYLAND_DISPLAY") {
+        eprintln!("[barrgreet] WAYLAND_DISPLAY={display}");
+    } else {
+        eprintln!("[barrgreet] WARNING: WAYLAND_DISPLAY is not set");
+    }
+
+    match env::var("GREETD_SOCK") {
+        Ok(sock) => eprintln!("[barrgreet] GREETD_SOCK={sock}"),
+        Err(_) => eprintln!("[barrgreet] WARNING: GREETD_SOCK is not set — login will fail"),
+    }
+
+    let sessions = detect_sessions();
+    if sessions.is_empty() {
+        eprintln!("[barrgreet] WARNING: no sessions found in /usr/share/wayland-sessions, /usr/share/xsessions, or NixOS paths");
+    } else {
+        eprintln!(
+            "[barrgreet] found {} session(s): {}",
+            sessions.len(),
+            sessions
+                .iter()
+                .map(|s| s.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+
+    eprintln!("[barrgreet] launching layer-shell UI");
+
+    let result = iced_layershell::application(boot, namespace, update, view)
         .style(style)
         .subscription(subscription)
         .settings(Settings {
@@ -448,5 +483,11 @@ fn main() -> iced_layershell::Result {
             },
             ..Default::default()
         })
-        .run()
+        .run();
+
+    if let Err(ref e) = result {
+        eprintln!("[barrgreet] ERROR: {e}");
+    }
+
+    result
 }
