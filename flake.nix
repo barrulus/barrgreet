@@ -8,7 +8,7 @@
     in {
       packages.${system}.default = pkgs.rustPlatform.buildRustPackage {
         pname = "barrgreet";
-        version = "0.1.5";
+        version = "0.2.0";
         src = self;
         cargoLock.lockFile = ./Cargo.lock;
         nativeBuildInputs = with pkgs; [ pkg-config makeWrapper ];
