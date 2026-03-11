@@ -1,0 +1,45 @@
+# barrgreet configuration
+# Place at /etc/barrgreet/config.toml, or pass a custom path with -c <path>
+# All values shown below are the defaults — only set what you want to change.
+
+[layout]
+# Position of the login card on screen:
+#   center, top, top-left, top-right, bottom, bottom-left, bottom-right, left, right
+position = "center"
+
+# Margins from screen edges (pixels)
+margin-top = 0
+margin-bottom = 0
+margin-left = 0
+margin-right = 0
+
+# Card dimensions
+card-width = 450
+card-padding = 32
+card-border-radius = 20.0
+spacing = 16
+
+[style]
+# Colors are hex RGB strings, opacity is 0.0–1.0
+background-color = "#14141E"
+background-opacity = 0.55
+border-color = "#FFFFFF"
+border-opacity = 0.15
+border-width = 1.0
+text-color = "#FFFFFF"
+error-color = "#FF8888"
+button-color = "#648CF0"
+button-opacity = 0.8
+destructive-color = "#C83C3C"
+destructive-opacity = 0.5
+
+[general]
+welcome-text = "Welcome"
+session-dirs = [
+    "/usr/share/wayland-sessions",
+    "/usr/share/xsessions",
+    "/run/current-system/sw/share/wayland-sessions",
+    "/run/current-system/sw/share/xsessions",
+    "/usr/local/share/wayland-sessions",
+    "/usr/local/share/xsessions",
+]

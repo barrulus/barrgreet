@@ -1,8 +1,11 @@
+mod config;
+
 use std::env;
 use std::fs;
 use std::os::unix::net::UnixStream;
 use std::process::Command;
 
+use config::{hex_to_color, Config};
 use greetd_ipc::codec::SyncCodec;
 use greetd_ipc::{Request, Response};
 use iced::widget::{button, column, container, pick_list, row, text, text_input};
@@ -28,20 +31,10 @@ impl std::fmt::Display for Session {
     }
 }
 
-fn detect_sessions() -> Vec<Session> {
-    let dirs = [
-        "/usr/share/wayland-sessions",
-        "/usr/share/xsessions",
-        // NixOS system profile
-        "/run/current-system/sw/share/wayland-sessions",
-        "/run/current-system/sw/share/xsessions",
-        // Common additional locations
-        "/usr/local/share/wayland-sessions",
-        "/usr/local/share/xsessions",
-    ];
+fn detect_sessions(dirs: &[String]) -> Vec<Session> {
     let mut sessions = Vec::new();
 
-    for dir in &dirs {
+    for dir in dirs {
         let Ok(entries) = fs::read_dir(dir) else {
             continue;
         };
@@ -171,6 +164,7 @@ struct Greeter {
     error: Option<String>,
     logging_in: bool,
     focus: Focus,
+    config: Config,
 }
 
 fn focus_widget(name: &'static str) -> Task<Message> {
@@ -180,7 +174,8 @@ fn focus_widget(name: &'static str) -> Task<Message> {
 // ── Application functions ──────────────────────────────────────────
 
 fn boot() -> (Greeter, Task<Message>) {
-    let sessions = detect_sessions();
+    let config = Config::load();
+    let sessions = detect_sessions(&config.general.session_dirs);
     let selected = sessions.first().cloned();
     (
         Greeter {
@@ -191,6 +186,7 @@ fn boot() -> (Greeter, Task<Message>) {
             error: None,
             logging_in: false,
             focus: Focus::Username,
+            config,
         },
         focus_widget("username"),
     )
@@ -305,6 +301,22 @@ fn update(state: &mut Greeter, message: Message) -> Task<Message> {
 }
 
 fn view(state: &Greeter) -> Element<'_, Message> {
+    let cfg = &state.config;
+    let style_cfg = &cfg.style;
+    let layout_cfg = &cfg.layout;
+
+    let text_color = hex_to_color(&style_cfg.text_color, 1.0);
+    let error_color = hex_to_color(&style_cfg.error_color, 1.0);
+    let button_bg = hex_to_color(&style_cfg.button_color, style_cfg.button_opacity);
+    let button_border_color = hex_to_color(&style_cfg.button_color, style_cfg.button_opacity * 0.5);
+    let destructive_bg = hex_to_color(&style_cfg.destructive_color, style_cfg.destructive_opacity);
+    let destructive_border_color =
+        hex_to_color(&style_cfg.destructive_color, style_cfg.destructive_opacity * 0.6);
+    let card_bg = hex_to_color(&style_cfg.background_color, style_cfg.background_opacity);
+    let card_border_color = hex_to_color(&style_cfg.border_color, style_cfg.border_opacity);
+    let card_border_width = style_cfg.border_width;
+    let card_border_radius = layout_cfg.card_border_radius;
+
     let username_input = text_input("Username", &state.username)
         .id(iced::widget::Id::new("username"))
         .on_input(Message::UsernameChanged)
@@ -337,13 +349,13 @@ fn view(state: &Greeter) -> Element<'_, Message> {
     )
     .width(Length::Fill)
     .padding(12)
-    .style(|_theme: &Theme, _status| button::Style {
-        background: Some(Background::Color(color!(0x64, 0x8C, 0xF0, 0.8))),
+    .style(move |_theme: &Theme, _status| button::Style {
+        background: Some(Background::Color(button_bg)),
         text_color: Color::WHITE,
         border: Border {
             radius: 10.0.into(),
             width: 1.0,
-            color: color!(0x8C, 0xAA, 0xFF, 0.4),
+            color: button_border_color,
         },
         ..Default::default()
     })
@@ -354,20 +366,20 @@ fn view(state: &Greeter) -> Element<'_, Message> {
     });
 
     let error_text: Element<Message> = if let Some(ref err) = state.error {
-        container(text(err).color(color!(0xFF, 0x88, 0x88)).size(14))
+        container(text(err).color(error_color).size(14))
             .padding(8)
             .into()
     } else {
         text("").into()
     };
 
-    let destructive_style = |_theme: &Theme, _status| button::Style {
-        background: Some(Background::Color(color!(0xC8, 0x3C, 0x3C, 0.5))),
+    let destructive_style = move |_theme: &Theme, _status| button::Style {
+        background: Some(Background::Color(destructive_bg)),
         text_color: Color::WHITE,
         border: Border {
             radius: 10.0.into(),
             width: 1.0,
-            color: color!(0xC8, 0x3C, 0x3C, 0.3),
+            color: destructive_border_color,
         },
         ..Default::default()
     };
@@ -388,7 +400,9 @@ fn view(state: &Greeter) -> Element<'_, Message> {
     // Glass card
     let card = container(
         column![
-            text("Welcome").size(28).color(Color::WHITE),
+            text(&cfg.general.welcome_text)
+                .size(28)
+                .color(text_color),
             username_input,
             password_input,
             session_picker,
@@ -396,34 +410,39 @@ fn view(state: &Greeter) -> Element<'_, Message> {
             error_text,
             power_row,
         ]
-        .spacing(16)
+        .spacing(layout_cfg.spacing as f32)
         .align_x(Alignment::Center)
         .width(Length::Fill),
     )
-    .width(450)
-    .padding(32)
-    .style(|_theme: &Theme| container::Style {
-        background: Some(Background::Color(color!(0x14, 0x14, 0x1E, 0.55))),
+    .width(layout_cfg.card_width as f32)
+    .padding(layout_cfg.card_padding as f32)
+    .style(move |_theme: &Theme| container::Style {
+        background: Some(Background::Color(card_bg)),
         border: Border {
-            radius: 20.0.into(),
-            width: 1.0,
-            color: color!(0xFF, 0xFF, 0xFF, 0.15),
+            radius: card_border_radius.into(),
+            width: card_border_width,
+            color: card_border_color,
         },
         shadow: Shadow {
             color: color!(0x00, 0x00, 0x00, 0.5),
             offset: iced::Vector::new(0.0, 8.0),
             blur_radius: 32.0,
         },
-        text_color: Some(Color::WHITE),
+        text_color: Some(text_color),
         snap: false,
     });
 
-    // Center on screen
     container(card)
         .width(Length::Fill)
         .height(Length::Fill)
-        .align_x(alignment::Horizontal::Center)
-        .align_y(alignment::Vertical::Center)
+        .padding(iced::Padding {
+            top: layout_cfg.margin_top as f32,
+            right: layout_cfg.margin_right as f32,
+            bottom: layout_cfg.margin_bottom as f32,
+            left: layout_cfg.margin_left as f32,
+        })
+        .align_x(layout_cfg.position.horizontal())
+        .align_y(layout_cfg.position.vertical())
         .into()
 }
 
@@ -439,6 +458,12 @@ fn style(_state: &Greeter, _theme: &Theme) -> iced::theme::Style {
 }
 
 fn main() -> iced_layershell::Result {
+    let args: Vec<String> = env::args().collect();
+    if args.iter().any(|a| a == "--init") {
+        print!("{}", config::DEFAULT_CONFIG);
+        std::process::exit(0);
+    }
+
     // Log startup diagnostics to stderr (visible via journalctl -u greetd)
     eprintln!("[barrgreet] starting");
 
@@ -453,9 +478,15 @@ fn main() -> iced_layershell::Result {
         Err(_) => eprintln!("[barrgreet] WARNING: GREETD_SOCK is not set — login will fail"),
     }
 
-    let sessions = detect_sessions();
+    // Load config early so we can log session dirs
+    let config = Config::load();
+
+    let sessions = detect_sessions(&config.general.session_dirs);
     if sessions.is_empty() {
-        eprintln!("[barrgreet] WARNING: no sessions found in /usr/share/wayland-sessions, /usr/share/xsessions, or NixOS paths");
+        eprintln!(
+            "[barrgreet] WARNING: no sessions found in: {}",
+            config.general.session_dirs.join(", ")
+        );
     } else {
         eprintln!(
             "[barrgreet] found {} session(s): {}",

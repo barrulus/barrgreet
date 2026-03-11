@@ -20,6 +20,7 @@
               pkgs.libxkbcommon
               pkgs.vulkan-loader
             ]}
+          install -Dm644 config.toml.example $out/share/barrgreet/config.toml.example
         '';
         meta.mainProgram = "barrgreet";
       };
