@@ -9,6 +9,7 @@ A minimal login greeter for [greetd](https://sr.ht/~kennylevinsen/greetd/), buil
 - Wayland-native via layer shell (covers the full screen on the `Top` layer)
 - Auto-detects available Wayland and X11 sessions from `.desktop` files
 - Glass-card UI with keyboard navigation (Tab to switch fields, Enter to login)
+- Configurable layout, colors, and position via TOML config file
 - Power off and reboot buttons
 
 ## Building
@@ -115,9 +116,40 @@ You should see output like:
 [barrgreet] launching layer-shell UI
 ```
 
+## Configuration
+
+barrgreet is configured via a TOML file at `/etc/barrgreet/config.toml`. All values are optional — barrgreet works with no config file, using sensible defaults.
+
+Generate a default config file:
+
+```sh
+sudo mkdir -p /etc/barrgreet
+barrgreet --init | sudo tee /etc/barrgreet/config.toml
+```
+
+Or use a custom path:
+
+```sh
+barrgreet -c /path/to/config.toml
+```
+
+See [`config.toml.example`](config.toml.example) for all available options. Key settings include:
+
+- **`[layout]`** — card position (`center`, `top-left`, `bottom-right`, etc.), margins, card width/padding/border radius
+- **`[style]`** — background, border, text, button, and error colors with opacity controls
+- **`[general]`** — welcome text, session directory search paths
+
+### NixOS
+
+Place your config in your NixOS repo and add to `configuration.nix`:
+
+```nix
+environment.etc."barrgreet/config.toml".source = ./path/to/barrgreet.toml;
+```
+
 ## Session Detection
 
-Sessions are discovered from `.desktop` files in:
+Sessions are discovered from `.desktop` files in the directories listed in `general.session-dirs` (defaults shown):
 
 - `/usr/share/wayland-sessions`
 - `/usr/share/xsessions`
