@@ -4,10 +4,13 @@ use std::env;
 use std::fs;
 use std::os::unix::net::UnixStream;
 use std::process::Command;
+use std::sync::mpsc;
+use std::time::Duration;
 
 use config::{hex_to_color, Config};
+use futures::StreamExt;
 use greetd_ipc::codec::SyncCodec;
-use greetd_ipc::{Request, Response};
+use greetd_ipc::{AuthMessageType, Request, Response};
 use iced::widget::{button, column, container, pick_list, row, text, text_input};
 use iced::{
     alignment, color, keyboard, Alignment, Background, Border, Color, Element, Length, Shadow,
@@ -16,6 +19,31 @@ use iced::{
 use iced_layershell::reexport::{Anchor, KeyboardInteractivity, Layer};
 use iced_layershell::settings::{LayerShellSettings, Settings};
 use iced_layershell::to_layer_message;
+
+// ── Locale helpers ─────────────────────────────────────────────────
+
+fn locale_preferences() -> Vec<String> {
+    let raw = env::var("LC_ALL")
+        .or_else(|_| env::var("LC_MESSAGES"))
+        .or_else(|_| env::var("LANG"))
+        .unwrap_or_default();
+    let base = raw
+        .split(['.', '@'])
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let mut prefs = Vec::new();
+    if !base.is_empty() {
+        prefs.push(base.clone());
+        if let Some(lang) = base.split('_').next() {
+            if lang != base && !lang.is_empty() {
+                prefs.push(lang.to_string());
+            }
+        }
+    }
+    prefs
+}
 
 // ── Session detection ──────────────────────────────────────────────
 
@@ -32,6 +60,7 @@ impl std::fmt::Display for Session {
 }
 
 fn detect_sessions(dirs: &[String]) -> Vec<Session> {
+    let locale_prefs = locale_preferences();
     let mut sessions = Vec::new();
 
     for dir in dirs {
@@ -46,16 +75,68 @@ fn detect_sessions(dirs: &[String]) -> Vec<Session> {
             let Ok(contents) = fs::read_to_string(&path) else {
                 continue;
             };
-            let mut name = None;
-            let mut exec = None;
+
+            let mut default_name: Option<String> = None;
+            let mut localized_names: Vec<(String, String)> = Vec::new();
+            let mut exec: Option<String> = None;
+            let mut try_exec: Option<String> = None;
+            let mut hidden = false;
+            let mut no_display = false;
+            let mut in_entry = false;
+
             for line in contents.lines() {
-                if let Some(v) = line.strip_prefix("Name=") {
-                    name = Some(v.to_string());
+                let trimmed = line.trim();
+                if trimmed.is_empty() || trimmed.starts_with('#') {
+                    continue;
                 }
-                if let Some(v) = line.strip_prefix("Exec=") {
+                if trimmed.starts_with('[') && trimmed.ends_with(']') {
+                    in_entry = trimmed == "[Desktop Entry]";
+                    continue;
+                }
+                if !in_entry {
+                    continue;
+                }
+
+                if let Some(rest) = trimmed.strip_prefix("Name") {
+                    if let Some(inside) = rest.strip_prefix('[') {
+                        if let Some(end) = inside.find(']') {
+                            let locale = &inside[..end];
+                            if let Some(v) = inside[end + 1..].strip_prefix('=') {
+                                localized_names.push((locale.to_string(), v.to_string()));
+                            }
+                        }
+                    } else if let Some(v) = rest.strip_prefix('=') {
+                        default_name = Some(v.to_string());
+                    }
+                } else if let Some(v) = trimmed.strip_prefix("Exec=") {
                     exec = Some(v.to_string());
+                } else if let Some(v) = trimmed.strip_prefix("TryExec=") {
+                    try_exec = Some(v.to_string());
+                } else if let Some(v) = trimmed.strip_prefix("Hidden=") {
+                    hidden = v.eq_ignore_ascii_case("true");
+                } else if let Some(v) = trimmed.strip_prefix("NoDisplay=") {
+                    no_display = v.eq_ignore_ascii_case("true");
                 }
             }
+
+            if hidden || no_display {
+                continue;
+            }
+            if let Some(ref tx) = try_exec {
+                if !binary_exists(tx) {
+                    continue;
+                }
+            }
+
+            let name = locale_prefs
+                .iter()
+                .find_map(|l| {
+                    localized_names
+                        .iter()
+                        .find_map(|(k, v)| if k == l { Some(v.clone()) } else { None })
+                })
+                .or(default_name);
+
             if let (Some(name), Some(exec)) = (name, exec) {
                 sessions.push(Session { name, exec });
             }
@@ -67,72 +148,152 @@ fn detect_sessions(dirs: &[String]) -> Vec<Session> {
     sessions
 }
 
-// ── greetd IPC (blocking, run in thread) ───────────────────────────
+fn binary_exists(bin: &str) -> bool {
+    let path = std::path::Path::new(bin);
+    if path.is_absolute() {
+        return path.is_file();
+    }
+    if let Ok(path_env) = env::var("PATH") {
+        for dir in path_env.split(':') {
+            if std::path::Path::new(dir).join(bin).is_file() {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+// ── greetd auth worker ─────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
-enum GreetdResult {
-    Success,
+enum AuthEvent {
+    Prompt { text: String, secret: bool },
+    Info(String),
     Error(String),
+    Completed,
+    Failed(String),
 }
 
-fn start_session(
-    stream: &mut UnixStream,
-    session_cmd: &[String],
-) -> GreetdResult {
-    let req = Request::StartSession {
-        cmd: session_cmd.to_vec(),
-        env: Vec::new(),
-    };
-    if let Err(e) = req.write_to(stream) {
-        return GreetdResult::Error(format!("write start: {e}"));
-    }
-    match Response::read_from(stream) {
-        Ok(Response::Success) => GreetdResult::Success,
-        Ok(Response::Error { description, .. }) => GreetdResult::Error(description),
-        Ok(_) => GreetdResult::Error("unexpected response after start".into()),
-        Err(e) => GreetdResult::Error(format!("read start: {e}")),
-    }
+/// Best-effort CancelSession so greetd's server-side state is cleared. Without
+/// this, a subsequent CreateSession is rejected and the greeter appears stuck.
+fn send_cancel(stream: &mut UnixStream) {
+    let _ = Request::CancelSession.write_to(stream);
+    let _ = Response::read_from(stream);
 }
 
-/// Run the full greetd login flow on a single connection.
-fn greetd_login(username: &str, password: &str, session_cmd: &[String]) -> GreetdResult {
+/// Full PAM conversation with greetd. Runs on a dedicated thread; prompts are
+/// surfaced via `event_tx` and user responses come back via `response_rx`.
+fn run_auth_worker(
+    username: String,
+    session_cmd: Vec<String>,
+    response_rx: mpsc::Receiver<String>,
+    event_tx: futures::channel::mpsc::UnboundedSender<AuthEvent>,
+) {
+    macro_rules! emit {
+        ($e:expr) => {{
+            if event_tx.unbounded_send($e).is_err() {
+                return;
+            }
+        }};
+    }
+
     let sock_path = match env::var("GREETD_SOCK") {
         Ok(p) => p,
-        Err(_) => return GreetdResult::Error("GREETD_SOCK not set".into()),
+        Err(_) => {
+            emit!(AuthEvent::Failed("GREETD_SOCK not set".into()));
+            return;
+        }
     };
     let mut stream = match UnixStream::connect(&sock_path) {
         Ok(s) => s,
-        Err(e) => return GreetdResult::Error(format!("connect: {e}")),
+        Err(e) => {
+            emit!(AuthEvent::Failed(format!("connect: {e}")));
+            return;
+        }
     };
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(60)));
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(30)));
 
-    // Step 1: Create session
-    let req = Request::CreateSession {
-        username: username.to_string(),
-    };
-    if let Err(e) = req.write_to(&mut stream) {
-        return GreetdResult::Error(format!("write create: {e}"));
+    if let Err(e) = (Request::CreateSession { username }).write_to(&mut stream) {
+        emit!(AuthEvent::Failed(format!("write create: {e}")));
+        return;
     }
 
-    match Response::read_from(&mut stream) {
-        Ok(Response::AuthMessage { .. }) => {
-            // Step 2: Send password
-            let req = Request::PostAuthMessageResponse {
-                response: Some(password.to_string()),
-            };
-            if let Err(e) = req.write_to(&mut stream) {
-                return GreetdResult::Error(format!("write auth: {e}"));
+    loop {
+        let resp = match Response::read_from(&mut stream) {
+            Ok(r) => r,
+            Err(e) => {
+                emit!(AuthEvent::Failed(format!("read: {e}")));
+                return;
             }
-
-            match Response::read_from(&mut stream) {
-                Ok(Response::Success) => start_session(&mut stream, session_cmd),
-                Ok(Response::Error { description, .. }) => GreetdResult::Error(description),
-                Ok(resp) => GreetdResult::Error(format!("unexpected after auth: {resp:?}")),
-                Err(e) => GreetdResult::Error(format!("read auth: {e}")),
+        };
+        match resp {
+            Response::Success => break,
+            Response::Error { description, .. } => {
+                send_cancel(&mut stream);
+                emit!(AuthEvent::Failed(description));
+                return;
+            }
+            Response::AuthMessage {
+                auth_message_type,
+                auth_message,
+            } => {
+                let reply = match auth_message_type {
+                    AuthMessageType::Secret | AuthMessageType::Visible => {
+                        let secret = matches!(auth_message_type, AuthMessageType::Secret);
+                        emit!(AuthEvent::Prompt {
+                            text: auth_message.clone(),
+                            secret,
+                        });
+                        match response_rx.recv() {
+                            Ok(s) => Some(s),
+                            Err(_) => {
+                                send_cancel(&mut stream);
+                                return;
+                            }
+                        }
+                    }
+                    AuthMessageType::Info => {
+                        eprintln!("[barrgreet] pam info: {auth_message}");
+                        emit!(AuthEvent::Info(auth_message));
+                        None
+                    }
+                    AuthMessageType::Error => {
+                        eprintln!("[barrgreet] pam error: {auth_message}");
+                        emit!(AuthEvent::Error(auth_message));
+                        None
+                    }
+                };
+                let req = Request::PostAuthMessageResponse { response: reply };
+                if let Err(e) = req.write_to(&mut stream) {
+                    send_cancel(&mut stream);
+                    emit!(AuthEvent::Failed(format!("write auth: {e}")));
+                    return;
+                }
             }
         }
-        Ok(Response::Success) => start_session(&mut stream, session_cmd),
-        Ok(Response::Error { description, .. }) => GreetdResult::Error(description),
-        Err(e) => GreetdResult::Error(format!("read create: {e}")),
+    }
+
+    let req = Request::StartSession {
+        cmd: session_cmd,
+        env: Vec::new(),
+    };
+    if let Err(e) = req.write_to(&mut stream) {
+        send_cancel(&mut stream);
+        emit!(AuthEvent::Failed(format!("write start: {e}")));
+        return;
+    }
+    match Response::read_from(&mut stream) {
+        Ok(Response::Success) => emit!(AuthEvent::Completed),
+        Ok(Response::Error { description, .. }) => {
+            send_cancel(&mut stream);
+            emit!(AuthEvent::Failed(description));
+        }
+        Ok(_) => {
+            send_cancel(&mut stream);
+            emit!(AuthEvent::Failed("unexpected response after start".into()));
+        }
+        Err(e) => emit!(AuthEvent::Failed(format!("read start: {e}"))),
     }
 }
 
@@ -145,15 +306,37 @@ enum Message {
     PasswordChanged(String),
     SessionSelected(Session),
     Login,
-    LoginResult(GreetdResult),
+    Auth(AuthEvent),
     PowerOff,
     Reboot,
     KeyboardEvent(keyboard::Event),
 }
 
-enum Focus {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FocusedWidget {
     Username,
     Password,
+}
+
+impl FocusedWidget {
+    fn toggle(self) -> Self {
+        match self {
+            FocusedWidget::Username => FocusedWidget::Password,
+            FocusedWidget::Password => FocusedWidget::Username,
+        }
+    }
+    fn id(self) -> &'static str {
+        match self {
+            FocusedWidget::Username => "username",
+            FocusedWidget::Password => "password",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct AuthPrompt {
+    text: String,
+    secret: bool,
 }
 
 struct Greeter {
@@ -162,12 +345,17 @@ struct Greeter {
     sessions: Vec<Session>,
     selected_session: Option<Session>,
     error: Option<String>,
+    pam_messages: Vec<String>,
+    auth_prompt: Option<AuthPrompt>,
+    pending_initial_response: Option<String>,
+    response_tx: Option<mpsc::Sender<String>>,
     logging_in: bool,
-    focus: Focus,
+    caps_lock: bool,
+    focus: FocusedWidget,
     config: Config,
 }
 
-fn focus_widget(name: &'static str) -> Task<Message> {
+fn focus_task(name: &'static str) -> Task<Message> {
     iced::widget::operation::focus(iced::widget::Id::new(name))
 }
 
@@ -184,11 +372,16 @@ fn boot() -> (Greeter, Task<Message>) {
             sessions,
             selected_session: selected,
             error: None,
+            pam_messages: Vec::new(),
+            auth_prompt: None,
+            pending_initial_response: None,
+            response_tx: None,
             logging_in: false,
-            focus: Focus::Username,
+            caps_lock: false,
+            focus: FocusedWidget::Username,
             config,
         },
-        focus_widget("username"),
+        focus_task("username"),
     )
 }
 
@@ -196,11 +389,61 @@ fn namespace() -> String {
     "barrgreet".to_string()
 }
 
+fn start_auth_session(state: &mut Greeter) -> Task<Message> {
+    if state.username.is_empty() {
+        state.error = Some("Username is required".into());
+        return Task::none();
+    }
+    let Some(session) = state.selected_session.clone() else {
+        state.error = Some("No session selected".into());
+        return Task::none();
+    };
+
+    state.logging_in = true;
+    state.error = None;
+    state.pam_messages.clear();
+    state.auth_prompt = None;
+
+    let (event_tx, event_rx) = futures::channel::mpsc::unbounded::<AuthEvent>();
+    let (resp_tx, resp_rx) = mpsc::channel::<String>();
+    state.response_tx = Some(resp_tx);
+    // Auto-submit the pre-typed password on the first Secret/Visible prompt
+    // so the normal password-only flow requires a single click, not two.
+    state.pending_initial_response = Some(std::mem::take(&mut state.password));
+
+    let username = state.username.clone();
+    let cmd: Vec<String> = vec!["sh".into(), "-c".into(), session.exec.clone()];
+
+    std::thread::spawn(move || {
+        run_auth_worker(username, cmd, resp_rx, event_tx);
+    });
+
+    Task::stream(event_rx.map(Message::Auth))
+}
+
+fn submit_prompt_response(state: &mut Greeter) {
+    if let Some(tx) = state.response_tx.as_ref() {
+        let response = std::mem::take(&mut state.password);
+        let _ = tx.send(response);
+        state.auth_prompt = None;
+    }
+}
+
+fn reset_auth_state(state: &mut Greeter) {
+    state.logging_in = false;
+    state.pending_initial_response = None;
+    state.auth_prompt = None;
+    state.response_tx = None;
+    state.password.clear();
+}
+
 fn update(state: &mut Greeter, message: Message) -> Task<Message> {
     match message {
         Message::UsernameChanged(u) => {
-            state.username = u;
-            state.error = None;
+            if !state.logging_in {
+                state.username = u;
+                state.error = None;
+            }
             Task::none()
         }
         Message::PasswordChanged(p) => {
@@ -209,58 +452,50 @@ fn update(state: &mut Greeter, message: Message) -> Task<Message> {
             Task::none()
         }
         Message::SessionSelected(s) => {
-            state.selected_session = Some(s);
+            if !state.logging_in {
+                state.selected_session = Some(s);
+            }
             Task::none()
         }
         Message::Login => {
-            if state.username.is_empty() {
-                state.error = Some("Username is required".into());
-                return Task::none();
-            }
-            let Some(session) = &state.selected_session else {
-                state.error = Some("No session selected".into());
-                return Task::none();
-            };
-
-            state.logging_in = true;
-            state.error = None;
-
-            let username = state.username.clone();
-            let password = state.password.clone();
-            let cmd: Vec<String> = session
-                .exec
-                .split_whitespace()
-                .map(String::from)
-                .collect();
-
-            Task::perform(
-                async move {
-                    // Run blocking IPC in a thread, await via futures channel
-                    let (tx, rx) = futures::channel::oneshot::channel();
-                    std::thread::spawn(move || {
-                        let result = greetd_login(&username, &password, &cmd);
-                        let _ = tx.send(result);
-                    });
-                    rx.await.unwrap_or_else(|_| {
-                        GreetdResult::Error("login thread panicked".into())
-                    })
-                },
-                Message::LoginResult,
-            )
-        }
-        Message::LoginResult(result) => {
-            state.logging_in = false;
-            match result {
-                GreetdResult::Success => {
-                    std::process::exit(0);
+            if state.logging_in {
+                if state.auth_prompt.is_some() {
+                    submit_prompt_response(state);
                 }
-                GreetdResult::Error(e) => {
-                    state.error = Some(e);
-                    state.password.clear();
-                    focus_widget("password")
-                }
+                Task::none()
+            } else {
+                start_auth_session(state)
             }
         }
+        Message::Auth(evt) => match evt {
+            AuthEvent::Prompt { text, secret } => {
+                state.auth_prompt = Some(AuthPrompt { text, secret });
+                if let Some(initial) = state.pending_initial_response.take() {
+                    if let Some(tx) = state.response_tx.as_ref() {
+                        let _ = tx.send(initial);
+                        state.auth_prompt = None;
+                    }
+                    Task::none()
+                } else {
+                    state.focus = FocusedWidget::Password;
+                    focus_task("password")
+                }
+            }
+            AuthEvent::Info(m) | AuthEvent::Error(m) => {
+                state.pam_messages.push(m);
+                Task::none()
+            }
+            AuthEvent::Completed => {
+                std::process::exit(0);
+            }
+            AuthEvent::Failed(err) => {
+                eprintln!("[barrgreet] login failed: {err}");
+                state.error = Some(err);
+                reset_auth_state(state);
+                state.focus = FocusedWidget::Password;
+                focus_task("password")
+            }
+        },
         Message::PowerOff => {
             let _ = Command::new("systemctl").arg("poweroff").spawn();
             Task::none()
@@ -273,29 +508,23 @@ fn update(state: &mut Greeter, message: Message) -> Task<Message> {
             keyboard::Event::KeyPressed {
                 key: keyboard::Key::Named(keyboard::key::Named::Tab),
                 ..
-            } => match state.focus {
-                Focus::Username => {
-                    state.focus = Focus::Password;
-                    focus_widget("password")
-                }
-                Focus::Password => {
-                    state.focus = Focus::Username;
-                    focus_widget("username")
-                }
-            },
+            } => {
+                state.focus = state.focus.toggle();
+                focus_task(state.focus.id())
+            }
             keyboard::Event::KeyPressed {
                 key: keyboard::Key::Named(keyboard::key::Named::Enter),
                 ..
+            } => update(state, Message::Login),
+            keyboard::Event::KeyPressed {
+                key: keyboard::Key::Named(keyboard::key::Named::CapsLock),
+                ..
             } => {
-                if !state.logging_in {
-                    update(state, Message::Login)
-                } else {
-                    Task::none()
-                }
+                state.caps_lock = !state.caps_lock;
+                Task::none()
             }
             _ => Task::none(),
         },
-        // iced_layershell action variants — not used but required by the macro
         _ => Task::none(),
     }
 }
@@ -323,12 +552,31 @@ fn view(state: &Greeter) -> Element<'_, Message> {
         .padding(12)
         .size(16);
 
-    let password_input = text_input("Password", &state.password)
+    let (password_placeholder, password_secure): (&str, bool) = match state.auth_prompt.as_ref() {
+        Some(p) => (p.text.as_str(), p.secret),
+        None => ("Password", true),
+    };
+    let password_input = text_input(password_placeholder, &state.password)
         .id(iced::widget::Id::new("password"))
         .on_input(Message::PasswordChanged)
-        .secure(true)
+        .secure(password_secure)
         .padding(12)
         .size(16);
+
+    let caps_indicator: Element<Message> = if state.caps_lock {
+        text("⚠ Caps Lock is on").size(12).color(error_color).into()
+    } else {
+        text("").into()
+    };
+
+    let pam_text: Element<Message> = if state.pam_messages.is_empty() {
+        text("").into()
+    } else {
+        let msg = state.pam_messages.join("\n");
+        container(text(msg).color(text_color).size(13))
+            .padding(8)
+            .into()
+    };
 
     let session_picker = pick_list(
         state.sessions.as_slice(),
@@ -338,14 +586,19 @@ fn view(state: &Greeter) -> Element<'_, Message> {
     .padding(12)
     .width(Length::Fill);
 
+    let login_label = if !state.logging_in {
+        "Login"
+    } else if state.auth_prompt.is_some() {
+        "Submit"
+    } else {
+        "Authenticating..."
+    };
+    let login_button_active = !state.logging_in || state.auth_prompt.is_some();
+
     let login_btn = button(
-        text(if state.logging_in {
-            "Logging in..."
-        } else {
-            "Login"
-        })
-        .width(Length::Fill)
-        .align_x(alignment::Horizontal::Center),
+        text(login_label)
+            .width(Length::Fill)
+            .align_x(alignment::Horizontal::Center),
     )
     .width(Length::Fill)
     .padding(12)
@@ -359,10 +612,10 @@ fn view(state: &Greeter) -> Element<'_, Message> {
         },
         ..Default::default()
     })
-    .on_press_maybe(if state.logging_in {
-        None
-    } else {
+    .on_press_maybe(if login_button_active {
         Some(Message::Login)
+    } else {
+        None
     });
 
     let error_text: Element<Message> = if let Some(ref err) = state.error {
@@ -397,7 +650,6 @@ fn view(state: &Greeter) -> Element<'_, Message> {
     .spacing(12)
     .align_y(Alignment::Center);
 
-    // Glass card
     let card = container(
         column![
             text(&cfg.general.welcome_text)
@@ -405,6 +657,8 @@ fn view(state: &Greeter) -> Element<'_, Message> {
                 .color(text_color),
             username_input,
             password_input,
+            caps_indicator,
+            pam_text,
             session_picker,
             login_btn,
             error_text,
@@ -464,7 +718,6 @@ fn main() -> iced_layershell::Result {
         std::process::exit(0);
     }
 
-    // Log startup diagnostics to stderr (visible via journalctl -u greetd)
     eprintln!("[barrgreet] starting");
 
     if let Ok(display) = env::var("WAYLAND_DISPLAY") {
@@ -478,7 +731,6 @@ fn main() -> iced_layershell::Result {
         Err(_) => eprintln!("[barrgreet] WARNING: GREETD_SOCK is not set — login will fail"),
     }
 
-    // Load config early so we can log session dirs
     let config = Config::load();
 
     let sessions = detect_sessions(&config.general.session_dirs);
